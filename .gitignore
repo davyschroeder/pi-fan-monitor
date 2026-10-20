@@ -1,0 +1,6 @@
+# pi-fan-monitor output files
+pi-fan-monitor_*.csv
+pi-fan-monitor_*.svg
+
+__pycache__/
+*.pyc
