@@ -6,11 +6,12 @@ Raspberry Pi, with a log file (CSV), a chart (SVG) and a built-in stress test.
 Usage:
   python3 pi-fan-monitor.py                  live monitoring (s = toggle stress, q = quit)
   python3 pi-fan-monitor.py --stress         automatic: 1 min idle, 5 min stress, 3 min cool-down
+  sudo python3 pi-fan-monitor.py --tune      learn a fan curve from measurements (and --apply it)
   python3 pi-fan-monitor.py --help           all options
 
 See README.md for details. Python 3 standard library only; Linux only.
 """
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import argparse
 import csv
@@ -33,6 +34,8 @@ THERMAL = "/sys/class/thermal/thermal_zone0/temp"
 FREQ = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
 ARGON_CONF = "/etc/argononed.conf"
 ARGON_DEFAULT = [(55, 30), (60, 55), (65, 100)]
+CONFIG_TXT = ["/boot/firmware/config.txt", "/boot/config.txt"]
+GUARD_TEMP = 78.0   # --tune never lets the Pi get hotter than this (it throttles from about 80 °C)
 
 # ================================================================ sensors
 
@@ -152,6 +155,22 @@ def find_hwmon_pwm(any_device=False):
     return None
 
 
+def detect_fan(choice):
+    """(fanmode, pwm_path). fanmode is 'pwm' (Pi 5 fan header), 'argon' (fan driven by an Argon ONE
+    case over I2C, its curve in argononed.conf) or 'none'.
+
+    A Pi 5 always has the fan-header driver, also when nothing is plugged in. So when argononed.conf
+    exists and the header reads 0 RPM (an Argon ONE V3 on a Pi 5, or a Pi 4 case), the Argon curve wins."""
+    if choice == "curve":
+        return "argon", None
+    pwm = find_hwmon_pwm(any_device=choice == "pwm")
+    if pwm and choice == "auto" and os.path.exists(ARGON_CONF) and not fan_rpm(pwm):
+        pwm = None
+    if pwm:
+        return "pwm", pwm
+    return ("argon" if os.path.exists(ARGON_CONF) else "none"), None
+
+
 def fan_rpm(pwm_path):
     if not pwm_path:
         return None
@@ -206,6 +225,247 @@ class Stress:
             if p.is_alive():
                 p.kill()
         self.procs = []
+
+# ================================================================ curve tuning (--tune)
+
+class FanControl:
+    """Sets the fan to a fixed speed during --tune and always gives control back afterwards.
+
+    Pi 5 fan header: switches the pwm-fan driver to manual (pwm1_enable=1) and back to automatic (2).
+    Argon ONE: temporarily writes a flat curve to argononed.conf and restarts the Argon daemon; the
+    original file is put back afterwards (a copy is kept as argononed.conf.pi-fan-monitor.bak)."""
+
+    def __init__(self, fanmode, pwm):
+        self.mode, self.pwm = fanmode, pwm
+        self.backup = None
+        self.pct = None
+
+    def _write(self, path, text):
+        with open(path, "w") as f:
+            f.write(text)
+
+    def set(self, pct):
+        pct = max(0, min(100, int(pct)))
+        if pct == self.pct:
+            return
+        if self.mode == "pwm":
+            self._write(os.path.join(os.path.dirname(self.pwm), "pwm1_enable"), "1")
+            self._write(self.pwm, str(round(pct * 2.55)))
+        elif self.mode == "argon":
+            if self.backup is None:
+                self.backup = read(ARGON_CONF) or ""
+                self._write(ARGON_CONF + ".pi-fan-monitor.bak", self.backup)
+            self._write(ARGON_CONF, f"# temporary flat curve written by pi-fan-monitor --tune\n30={pct}\n")
+            subprocess.run(["systemctl", "restart", "argononed"], capture_output=True, timeout=20)
+        self.pct = pct
+
+    def restore(self):
+        try:
+            if self.mode == "pwm" and self.pct is not None:
+                self._write(os.path.join(os.path.dirname(self.pwm), "pwm1_enable"), "2")
+            elif self.mode == "argon" and self.backup is not None:
+                self._write(ARGON_CONF, self.backup)
+                subprocess.run(["systemctl", "restart", "argononed"], capture_output=True, timeout=20)
+        except Exception as e:
+            print(f"Could not give the fan back to the system ({e}). Reboot the Pi to be safe.")
+        self.pct = None
+
+
+def slope_per_min(samples):
+    """Least-squares slope in °C per minute of [(t, temp), ...]."""
+    n = len(samples)
+    if n < 2:
+        return 0.0
+    mt = sum(t for t, _ in samples) / n
+    mv = sum(v for _, v in samples) / n
+    den = sum((t - mt) ** 2 for t, _ in samples)
+    return 60 * sum((t - mt) * (v - mv) for t, v in samples) / den if den else 0.0
+
+
+class Tuner:
+    """The --tune sequence.
+
+    1. idle, fan off: how warm the Pi gets on its own (so the learned curve keeps the fan off at idle)
+    2. full load at a few fixed fan speeds, from fast to slow: the temperature each speed can hold
+    A step ends when the temperature is stable (less than 0.3 °C per minute over the last minute) or
+    after max_s seconds. Above GUARD_TEMP the fan goes to 100 % and the slower speeds are skipped."""
+
+    def __init__(self, fan, stress, levels=(100, 75, 55, 40), min_s=90, max_s=300):
+        self.fan, self.stress = fan, stress
+        self.steps = [("idle", 0)] + [("load", lv) for lv in levels]
+        self.min_s, self.max_s = min_s, max_s
+        self.i, self.t_start, self.samples = 0, None, []
+        self.idle_temp = None
+        self.results = []        # [(fan %, steady temperature or None when it got too hot)]
+        self.too_hot = False
+
+    def name(self):
+        kind, lv = self.steps[self.i]
+        return "tune idle" if kind == "idle" else f"tune {lv}%"
+
+    def _next(self, value):
+        kind, lv = self.steps[self.i]
+        if kind == "idle":
+            self.idle_temp = value
+        else:
+            self.results.append((lv, value))
+        self.i += 1
+        self.t_start, self.samples = None, []
+        if value is None:   # too hot: the slower speeds can only be hotter
+            self.too_hot = True
+            self.i = len(self.steps)
+
+    def update(self, el, temp):
+        """Called after every measurement. Returns (phase name, seconds left at most, done)."""
+        if self.i >= len(self.steps):
+            return "done", None, True
+        kind, lv = self.steps[self.i]
+        if self.t_start is None:
+            self.t_start = el
+            self.fan.set(lv)
+            (self.stress.start if kind == "load" else self.stress.stop)()
+        if temp is not None:
+            self.samples.append((el, temp))
+        run = el - self.t_start
+        recent = [x for x in self.samples if x[0] >= el - 60]
+        if temp is not None and temp >= GUARD_TEMP:
+            self.fan.set(100)
+            if kind == "idle":   # needs the fan even at idle: note it and carry on with the load steps
+                self.idle_temp = GUARD_TEMP
+                self.i += 1
+                self.t_start, self.samples = None, []
+            else:
+                self.stress.stop()
+                self._next(None)
+        elif run >= self.max_s or (run >= self.min_s and abs(slope_per_min(recent)) < 0.3):
+            last = [v for t, v in self.samples if t >= el - 30]
+            self._next(sum(last) / len(last) if last else temp)
+        done = self.i >= len(self.steps)
+        if done:
+            self.stress.stop()
+        return self.name() if not done else "done", None if done else max(0, self.max_s - run), done
+
+
+def learn_curve(idle_temp, results, target):
+    """A four-step fan curve [(°C, fan %), ...] from the --tune measurements.
+
+    - Under full load the Pi settles at `target` °C: the curve reaches the slowest fan speed that holds
+      `target` (interpolated between the measured speeds) exactly at `target`, and 100 % 5 °C above it.
+    - At idle the fan stays off: the curve starts 4 °C above the idle temperature without fan, unless
+      that is too close to the target; then the fan has to run a little at idle as well.
+    Returns (curve, notes)."""
+    notes = []
+    pts = sorted((lv, t) for lv, t in results if t is not None)   # slow → fast
+    if not pts:
+        return None, ["Even the fastest fan speed could not keep the Pi below "
+                      f"{GUARD_TEMP:.0f} °C. Check the fan and the case before tuning."]
+    lowest = pts[0][0]
+    # the slowest speed that still holds the target
+    need = None
+    if pts[0][1] <= target:
+        need = pts[0][0]
+    else:
+        for (l1, t1), (l2, t2) in zip(pts, pts[1:]):
+            if t1 > target >= t2:   # between a slower (hotter) and a faster (cooler) speed
+                need = l1 + (l2 - l1) * (t1 - target) / ((t1 - t2) or 1)
+                break
+    if need is None:
+        need = 100
+        notes.append(f"Even at 100 % the Pi settles at {pts[-1][1]:.0f} °C under full load, above the "
+                     f"target of {target:.0f} °C. The curve uses full speed from {pts[-1][1] - 2:.0f} °C; "
+                     "better cooling (or a higher --target) would help.")
+        target = pts[-1][1] - 2
+    need = min(100, 5 * math.ceil(need / 5))
+    start_speed = min(lowest, 40, need)   # never start above 40 %: the first step should be quiet
+    idle = idle_temp if idle_temp is not None else 45
+    t_on = round(idle + 4)
+    if t_on > target - 10:
+        t_on = round(target - 12)
+        notes.append(f"Without a fan the Pi already reaches {idle:.0f} °C at idle, so the fan runs slowly "
+                     f"from {t_on} °C to keep it quiet but cool.")
+    t_on = max(30, t_on)
+    t_mid = round((t_on + target) / 2)
+    mid_speed = 5 * round((start_speed + need) / 2 / 5)
+    curve = [(t_on, start_speed), (t_mid, max(start_speed, mid_speed)), (round(target), need),
+             (round(target) + 5, 100)]
+    for i in range(1, 4):   # temperatures and speeds must go up step by step
+        t, sp = curve[i]
+        curve[i] = (max(t, curve[i - 1][0] + 2), max(sp, curve[i - 1][1]))
+    return curve, notes
+
+
+def curve_config(fanmode, curve, stamp):
+    """The text for config.txt (Pi 5 fan header) or argononed.conf (Argon ONE)."""
+    if fanmode == "pwm":
+        lines = [f"# fan curve learned by pi-fan-monitor --tune on {stamp}"]
+        for i, (t, sp) in enumerate(curve):
+            lines += [f"dtparam=fan_temp{i}={int(t * 1000)}", f"dtparam=fan_temp{i}_hyst=5000",
+                      f"dtparam=fan_temp{i}_speed={round(sp * 2.55)}"]
+        return "\n".join(lines) + "\n"
+    return (f"# fan curve learned by pi-fan-monitor --tune on {stamp}\n"
+            + "".join(f"{t}={sp}\n" for t, sp in curve))
+
+
+def apply_curve(fanmode, text, stamp):
+    """Writes the learned curve, after making a backup. Returns a message for the user."""
+    if fanmode == "argon":
+        old = read(ARGON_CONF) or ""
+        with open(f"{ARGON_CONF}.bak-{stamp}", "w") as f:
+            f.write(old)
+        with open(ARGON_CONF, "w") as f:
+            f.write(text)
+        subprocess.run(["systemctl", "restart", "argononed"], capture_output=True, timeout=20)
+        return (f"Written to {ARGON_CONF} and the Argon daemon restarted: the new curve is active now.\n"
+                f"Backup of the old file: {ARGON_CONF}.bak-{stamp}")
+    path = next((p for p in CONFIG_TXT if os.path.exists(p)), None)
+    if not path:
+        return "config.txt not found; add the lines above to it yourself."
+    lines = read(path).split("\n")
+    fan_line = re.compile(r"^\s*dtparam=(fan_temp\d+(_hyst|_speed)?=\d+\s*,?\s*)+$")
+    if any("fan_temp" in l and not fan_line.match(l) and not l.lstrip().startswith("#") for l in lines):
+        return (f"{path} has fan_temp settings mixed with other settings on one line. "
+                "Edit it yourself: replace the fan_temp lines with the lines above.")
+    keep, first = [], None
+    for l in lines:
+        if fan_line.match(l) or l.strip().startswith("# fan curve learned by pi-fan-monitor"):
+            if first is None:
+                first = len(keep)
+            continue
+        keep.append(l)
+    block = text.rstrip("\n").split("\n")
+    if first is None:
+        while keep and not keep[-1].strip():
+            keep.pop()
+        sections = [l.strip() for l in keep if l.strip().startswith("[")]
+        keep += ([""] if sections and sections[-1] == "[all]" else ["", "[all]"]) + block + [""]
+    else:
+        keep[first:first] = block
+    with open(f"{path}.bak-{stamp}", "w") as f:
+        f.write("\n".join(lines))
+    with open(path, "w") as f:
+        f.write("\n".join(keep))
+    return (f"Written to {path} (backup: {path}.bak-{stamp}).\n"
+            "Reboot the Pi to activate it: sudo reboot")
+
+
+def tune_report(fanmode, tuner, curve, notes, target, text):
+    print(f"\n{BOLD}Fan curve tuning{RESET}")
+    if tuner.idle_temp is not None:
+        print(f"  idle, fan off      settles at {tuner.idle_temp:5.1f} °C")
+    for lv, t in tuner.results:
+        print(f"  full load, fan {lv:>3}% " + (f"settles at {t:5.1f} °C" if t is not None
+                                              else f"too hot (above {GUARD_TEMP:.0f} °C), stopped"))
+    if tuner.i < len(tuner.steps) and not tuner.too_hot:
+        print("  (stopped before the end)")
+    for n in notes:
+        print(f"  {n}")
+    if not curve:
+        return
+    print(f"\n{BOLD}Learned curve{RESET} (target under full load: {target:.0f} °C)")
+    print("  " + "   ".join(f"{t}°C → {sp}%" for t, sp in curve))
+    where = "/boot/firmware/config.txt" if fanmode == "pwm" else ARGON_CONF
+    print(f"\nFor {where}:\n")
+    print(text)
 
 # ================================================================ drawing
 
@@ -400,9 +660,10 @@ def render(st):
     stat_txt, sev = throttle_status(r["throttle"])
     stat_c = [(90, 210, 130), (235, 200, 80), (240, 80, 80)][sev]
     ph = r["phase"]
-    ph_c = (240, 110, 90) if ph == "stress" else (110, 190, 255) if ph == "cooldown" else (90, 210, 130)
+    ph_c = ((240, 110, 90) if ph == "stress" or (ph.startswith("tune") and ph != "tune idle")
+            else (110, 190, 255) if ph == "cooldown" else (90, 210, 130))
     fan_src = ((f"{r['rpm']} rpm" if r.get("rpm") is not None else "measured") if st["fanmode"] == "pwm"
-               else "curve" if st["fanmode"] == "argon" else "n/a")
+               else "fixed" if st.get("tuner") else "curve" if st["fanmode"] == "argon" else "n/a")
     D, T = rgb(C_DIM), rgb(C_TEXT)
     info = [
         f" {D}phase{RESET}  {BOLD}{rgb(ph_c)}● {ph.upper()}{RESET}"
@@ -510,9 +771,10 @@ def write_svg(path, rows, title):
          f'<text x="{ml}" y="30" font-size="17" font-weight="600">{title}</text>']
     start = None
     for r in rows + [{"t": tmax, "phase": "end"}]:
-        if r["phase"] == "stress" and start is None:
+        loaded = r["phase"] == "stress" or (r["phase"].startswith("tune") and r["phase"] != "tune idle")
+        if loaded and start is None:
             start = r["t"]
-        elif r["phase"] != "stress" and start is not None:
+        elif not loaded and start is not None:
             for (a, b) in (p1, p2):
                 s.append(f'<rect x="{X(start):.1f}" y="{a}" width="{X(r["t"]) - X(start):.1f}" '
                          f'height="{b - a}" fill="#fde2d8"/>')
@@ -586,6 +848,14 @@ def main():
     ap.add_argument("--braille", action="store_true",
                     help="finer braille graphs (only looks good if your font renders braille well)")
     ap.add_argument("--duration", type=int, default=0, help="stop after N seconds (without --stress)")
+    ap.add_argument("--tune", action="store_true",
+                    help="learn a fan curve: measures idle and full load at several fixed fan speeds "
+                         "(about 15-25 minutes, needs sudo) and prints a curve for config.txt or argononed.conf")
+    ap.add_argument("--target", type=float, default=70,
+                    help="with --tune: the temperature the Pi may reach under full load (default 70)")
+    ap.add_argument("--apply", action="store_true",
+                    help="with --tune: write the learned curve (after a backup), asks first")
+    ap.add_argument("--yes", action="store_true", help="with --apply: don't ask")
     a = ap.parse_args()
 
     host = socket.gethostname()
@@ -593,13 +863,25 @@ def main():
     phases = [("idle", a.idle), ("stress", a.load), ("cooldown", a.cool)] if a.stress else None
     curve, curve_src = load_curve()
     stress = Stress()
-    pwm = None if a.fan == "curve" else find_hwmon_pwm(any_device=a.fan == "pwm")
-    fanmode = ("pwm" if pwm else
-               "argon" if a.fan == "curve" or os.path.exists(ARGON_CONF) else "none")
+    fanmode, pwm = detect_fan(a.fan)
+    tuner = None
+    if a.tune:
+        if fanmode == "none":
+            sys.exit("--tune: no controllable fan found (no Pi 5 fan header in use and no "
+                     f"{ARGON_CONF}). See 'Supported fans' in the README.")
+        if os.geteuid() != 0:
+            sys.exit("--tune sets the fan speed itself and needs root: sudo python3 pi-fan-monitor.py --tune")
+        if fanmode == "argon" and not shutil.which("systemctl"):
+            sys.exit("--tune: systemctl not found, cannot restart the Argon daemon.")
+        if not 50 <= a.target <= GUARD_TEMP - 3:
+            sys.exit(f"--target must be between 50 and {GUARD_TEMP - 3:.0f} °C.")
+        tuner = Tuner(FanControl(fanmode, pwm), stress)
+        phases = None
+        base += "_tune"
     st = {"host": host, "csv": base + ".csv", "curve": curve, "curve_src": curve_src,
           "pwm": pwm, "fanmode": fanmode,
           "braille": a.braille, "daemon": argon_daemon() if fanmode == "argon" else None,
-          "stress": stress, "auto": a.stress,
+          "stress": stress, "auto": a.stress or a.tune, "tuner": tuner,
           "hist_temp": deque(maxlen=1200), "hist_fan": deque(maxlen=1200),
           "hist_load": deque(maxlen=1200), "core_loads": {}}
     rows = []
@@ -624,7 +906,11 @@ def main():
         while not stop["now"]:
             el = time.time() - t0
             left = None
-            if phases:
+            if tuner:
+                phase, left, done = tuner.update(el, st["last"]["temp"] if rows else cpu_temp())
+                if done:
+                    break
+            elif phases:
                 acc, phase = 0, None
                 for name, dur in phases:
                     if el < acc + dur:
@@ -646,6 +932,8 @@ def main():
             if st["pwm"]:
                 v = read(st["pwm"])
                 fan = round(int(v) / 255 * 100) if v else None
+            elif tuner:
+                fan = tuner.fan.pct
             else:
                 fan = fan_from_curve(temp, curve) if fanmode == "argon" else None
             r = {"t": el, "phase": phase, "temp": temp, "fan": fan, "rpm": fan_rpm(st["pwm"]), "load": ld.get("cpu", 0.0),
@@ -679,6 +967,8 @@ def main():
                     time.sleep(0.05)
     finally:
         stress.stop()
+        if tuner:
+            tuner.fan.restore()
         f.close()
         sys.stdout.write("\033[?25h\033[?1049l")
         if tty_old is not None:
@@ -688,8 +978,38 @@ def main():
         if write_svg(base + ".svg", rows, title):
             print(f"Chart saved: {base}.svg")
         print(f"Measurements saved: {base}.csv")
-        if rows:
+        if rows and not tuner:
             summary(rows)
+        if tuner:
+            finish_tune(a, fanmode, tuner, base)
+
+
+def finish_tune(a, fanmode, tuner, base):
+    curve, notes = learn_curve(tuner.idle_temp, tuner.results, a.target)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    text = curve_config(fanmode, curve, datetime.now().strftime("%Y-%m-%d %H:%M")) if curve else ""
+    tune_report(fanmode, tuner, curve, notes, a.target, text)
+    if not curve:
+        return
+    if len(tuner.results) < 2 and not tuner.too_hot:
+        print("Too few measurements to trust this curve (the tuning was stopped early); not applying it.")
+        return
+    with open(base + "_curve.txt", "w") as out:
+        out.write(text)
+    print(f"Curve saved: {base}_curve.txt")
+    if not a.apply:
+        print("Run with --apply to write it for you (a backup is made first).")
+        return
+    if not a.yes:
+        try:
+            ok = input("Write this curve now? [y/N] ").strip().lower() in ("y", "yes", "j", "ja")
+        except EOFError:
+            ok = False
+        if not ok:
+            print("Not written.")
+            return
+    print(apply_curve(fanmode, text, stamp))
+    print("Check the result afterwards with: python3 pi-fan-monitor.py --stress")
 
 
 if __name__ == "__main__":

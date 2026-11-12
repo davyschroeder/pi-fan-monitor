@@ -10,7 +10,8 @@ A terminal dashboard for the **CPU temperature and fan of a Raspberry Pi**, with
 - Fan speed and CPU load in one mirrored graph, so you can see right away whether the fan follows the load smoothly or keeps switching on and off
 - Per-core load meters, clock speed and throttle status (`vcgencmd get_throttled`)
 - **Real fan readings on the Pi 5**: PWM level and RPM from the Pi 5 fan header
-- **Argon ONE support** (Pi 4): reads the fan curve from `/etc/argononed.conf` and shows whether the Argon daemon is running
+- **Argon ONE support** (Pi 4, and the Argon ONE V3 on a Pi 5): reads the fan curve from `/etc/argononed.conf` and shows whether the Argon daemon is running
+- **Learns a fan curve for you** (`--tune`): measures how warm your Pi gets at several fan speeds and works out a quiet curve that still keeps it cool, and can write it to `config.txt` or `argononed.conf` (see [Learning a fan curve automatically](#learning-a-fan-curve-automatically))
 - Step-by-step guide to a quieter fan curve (see [Setting the fan curve](#setting-the-fan-curve))
 - Built-in stress test: toggle it with one key, or run an automatic idle → stress → cool-down sequence
 - Saves every measurement as **CSV**, draws an **SVG chart** and prints a summary per phase
@@ -43,6 +44,7 @@ Without `stress-ng`, pi-fan-monitor uses a built-in Python load on all cores.
 ```bash
 python3 pi-fan-monitor.py                 # live monitoring
 python3 pi-fan-monitor.py --stress        # automatic test: 1 min idle, 5 min stress, 3 min cool-down
+sudo python3 pi-fan-monitor.py --tune     # learn a fan curve from measurements (about 15-25 minutes)
 ```
 
 | Key | Action |
@@ -61,6 +63,10 @@ python3 pi-fan-monitor.py --stress        # automatic test: 1 min idle, 5 min st
 | `--interval N` | 1 | seconds between measurements |
 | `--duration N` | – | stop after N seconds (without `--stress`) |
 | `--fan auto\|curve\|pwm` | auto | where the fan reading comes from (see below) |
+| `--tune` | off | learn a fan curve (needs `sudo`), see below |
+| `--target N` | 70 | with `--tune`: the temperature the Pi may reach under full load, in °C |
+| `--apply` | off | with `--tune`: write the learned curve (asks first, makes a backup) |
+| `--yes` | off | with `--apply`: don't ask |
 | `--braille` | off | finer braille graphs; only looks good if your font renders braille well |
 | `--version` | | show the version |
 
@@ -76,6 +82,7 @@ When you stop, the current directory contains:
 
 - `pi-fan-monitor_<host>_<date-time>.csv`: all measurements (time, phase, temperature, fan %, RPM, load, clock, throttle status)
 - `pi-fan-monitor_<host>_<date-time>.svg`: a chart of temperature, fan and load with the stress phase highlighted; open it in a browser
+- with `--tune`, the file names end in `_tune`, plus `..._tune_curve.txt` with the learned curve
 
 The terminal shows a summary per phase: minimum, maximum and final temperature, the highest fan level, **how many times the fan changed speed**, and whether the Pi throttled. The number of speed changes is a good way to compare fan curves: the lower it is, the calmer the fan.
 
@@ -86,18 +93,18 @@ pi-fan-monitor is made for two kinds of Raspberry Pi fans. It detects which one 
 | Fan connection | Examples | Fan curve is set in | What pi-fan-monitor shows |
 |---|---|---|---|
 | **Pi 5 fan header**: the small 4-pin JST connector on the Pi 5 board, marked `FAN` | official Raspberry Pi Active Cooler, Argon ONE V5, most Pi 5 cases with a fan | `/boot/firmware/config.txt` | measured PWM level and RPM |
-| **Argon ONE for the Pi 4**: the fan is driven by the case over I2C | Argon ONE, Argon ONE M.2 (Pi 4) | `/etc/argononed.conf` | the level the Argon daemon picks from its curve; this fan has no RPM sensor |
+| **Argon ONE fan driven by the case** over I2C, by the Argon script | Argon ONE, Argon ONE M.2 (Pi 4), Argon ONE V3 (Pi 5) | `/etc/argononed.conf` | the level the Argon daemon picks from its curve; this fan has no RPM sensor |
 | No fan found | | | `–` |
 
 Fans on the GPIO 5V pins without a control wire run at a fixed speed and cannot be measured.
 
-Use `--fan curve` or `--fan pwm` to force a source.
+A Pi 5 always has the fan-header driver, even when nothing is plugged into the header. So when `/etc/argononed.conf` exists and the header reads 0 RPM (an Argon ONE V3, whose fan the case drives), pi-fan-monitor uses the Argon curve. Use `--fan curve` or `--fan pwm` to force a source.
 
 ### Which one do I have?
 
 ```bash
 grep -l pwmfan /sys/class/hwmon/hwmon*/name      # a result: Pi 5 fan header
-ls /etc/argononed.conf                            # file exists: Argon ONE (Pi 4)
+ls /etc/argononed.conf                            # file exists: Argon ONE driven by the Argon script
 ```
 
 On a Pi 5 you can also test the fan by hand. This runs it at full speed for 5 seconds, prints the RPM and hands control back to the Pi:
@@ -166,9 +173,9 @@ There are four steps (0 to 3), and the temperatures must go up from step to step
 
 Hysteresis is what stops the on/off pumping: with `hyst=5000`, a fan that switched on at 40 °C only switches off again once the Pi has cooled to 35 °C.
 
-### Argon ONE (Pi 4): `argononed.conf`
+### Argon ONE: `argononed.conf`
 
-The Argon ONE for the Pi 4 controls its fan with the Argon script, not with `config.txt`. Edit the curve with `argonone-config` or directly:
+The Argon ONE (and the Argon ONE V3 on a Pi 5) controls its fan with the Argon script, not with `config.txt`. Edit the curve with `argonone-config` or directly:
 
 ```bash
 sudo nano /etc/argononed.conf
@@ -186,6 +193,33 @@ Each line is `temperature=speed%`, for example:
 ```
 
 Restart the service with `sudo systemctl restart argononed`. pi-fan-monitor reads this file and shows the curve and the daemon status in the info panel.
+
+## Learning a fan curve automatically
+
+Instead of trying curves by hand, let pi-fan-monitor measure what your Pi needs:
+
+```bash
+sudo python3 pi-fan-monitor.py --tune            # measure and show the learned curve
+sudo python3 pi-fan-monitor.py --tune --apply    # ... and write it (asks first, makes a backup)
+```
+
+It takes about 15 to 25 minutes, and you can watch it in the dashboard. pi-fan-monitor takes over the fan for that time:
+
+1. **Idle, fan off**: how warm the Pi gets on its own. The learned curve starts a few degrees above that, so the fan stays off when the Pi has nothing to do.
+2. **Full load at 100, 75, 55 and 40 % fan speed**: for each speed, the temperature it can hold. A step ends as soon as the temperature is stable (or after 5 minutes).
+
+From that it builds a four-step curve: it starts quietly, reaches the **slowest fan speed that keeps the Pi at the target under full load** (70 °C by default, change it with `--target`), and goes to full speed 5 °C above that. Every step has 5 °C hysteresis, so the fan does not pump on and off.
+
+Safety: the Pi never gets hotter than 78 °C during the test. If it does, the fan goes to full speed and the slower speeds are skipped. Afterwards, also after `q` or `Ctrl+C`, the fan is always given back to the system.
+
+| Fan | What `--apply` does |
+|---|---|
+| Pi 5 fan header | replaces the `dtparam=fan_temp…` lines in `/boot/firmware/config.txt` (or adds them under `[all]`); backup `config.txt.bak-<date-time>`; **reboot** to activate |
+| Argon ONE | writes `/etc/argononed.conf` and restarts the Argon daemon, active right away; backup `argononed.conf.bak-<date-time>` |
+
+Without `--apply`, the curve is printed and saved as `pi-fan-monitor_<host>_<date-time>_tune_curve.txt`, so you can add it yourself (see [Setting the fan curve](#setting-the-fan-curve)). Check the result afterwards with `python3 pi-fan-monitor.py --stress`.
+
+Run the tuning with the case closed and in the place where the Pi normally stands: the curve is only as good as the conditions it was measured in.
 
 ## Requirements
 
